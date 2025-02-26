@@ -4,16 +4,13 @@ import threading
 import logging
 import time
 import requests
-import openai
 
-from pathlib import Path
 from utils import setup_logging, load_environment, exit_with_error
 from bot import Bot
 from console import master_console
-import gui
+import gui  # Our gui.py module
 
-# Build path to the configs folder at the project root
-CONFIGS_DIR = os.path.join(Path(__file__).parent.parent, "configs")
+CONFIGS_DIR = os.path.join(os.path.dirname(__file__), "..", "configs")
 
 def load_config_files():
     if not os.path.exists(CONFIGS_DIR):
@@ -27,11 +24,21 @@ def load_config_files():
 def initialize_bots(config_files):
     bots = {}
     port_start = 5050
+    from src.platforms.twitter import TwitterAdapter
+    from src.platforms.facebook import FacebookAdapter
+    from src.platforms.instagram import InstagramAdapter
+    from src.platforms.telegram import TelegramAdapter
+    from src.platforms.discord import DiscordAdapter
     for i, cfg in enumerate(config_files):
         bot_name = os.path.splitext(os.path.basename(cfg))[0]
         port = port_start + i
         bot = Bot(name=bot_name, config_path=cfg, port=port)
         bot.load_config()
+        bot.add_platform_adapter("twitter", TwitterAdapter(bot))
+        bot.add_platform_adapter("facebook", FacebookAdapter(bot))
+        bot.add_platform_adapter("instagram", InstagramAdapter(bot))
+        bot.add_platform_adapter("telegram", TelegramAdapter(bot))
+        bot.add_platform_adapter("discord", DiscordAdapter(bot))
         bots[bot_name] = bot
     return bots
 
@@ -44,16 +51,14 @@ def start_gui(bots):
 def main():
     setup_logging()
     load_environment()
+    import openai
     openai.api_key = os.getenv("OPENAI_API_KEY")
-
     config_files = load_config_files()
     bots = initialize_bots(config_files)
-
-    # Start the GUI in a separate thread
     start_gui(bots)
-
     input("Press Enter to start the Master Console...")
-    master_console(bots)
+    bots_dict = {bot.name.lower(): bot for bot in bots.values()}
+    master_console(bots_dict)
 
 if __name__ == "__main__":
     main()

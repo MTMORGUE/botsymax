@@ -6,77 +6,28 @@ import threading
 import time
 import re
 import random
-import signal
 import datetime
-import tweepy
 import schedule
 import pytz
 import openai
 import yaml
 import requests
 from flask import Flask, request
+from pathlib import Path
+from src.utils import setup_logging
+from src.platforms.base_adapter import BasePlatformAdapter
 from jinja2 import Template
 from textblob import TextBlob
-from pathlib import Path
 
-"""
-Botsy: Twitter Bot Service (Multi-Bot Version) – Extended
+# Setup logging
+setup_logging()
 
-This version adds new functionality:
-  - Cross-bot engagement: bots can retweet/reply to tweets from fellow bots.
-  - Persistent conversation memory: saving/retrieving conversation threads.
-  - Mood & sentiment modulation: analyzing tweet sentiment and adjusting tone.
-  - Trending & hashtag response: fetching trending topics and auto-engaging.
-  - Direct messaging: sending and checking DMs for private interactions.
-  - Collaborative storytelling: bots co-author narrative threads.
-  - Visual/multimedia enhancements: generating images (e.g., via DALL·E) and tweeting with them.
-  - Feedback & adaptive tuning: tracking engagement metrics and adjusting prompt parameters.
-  - Enhanced dashboard: a simple console-based analytics summary.
-
-Additionally, new capabilities include:
-  1. Richer Personality & Emotional Modeling:
-      • Dynamic Personality Frameworks (Big Five traits).
-      • Complex Emotional States with decay.
-  2. Enhanced Contextual Awareness:
-      • Extended persistent memory for interactions.
-      • Multi-Modal Inputs (weather, calendar, etc.).
-  3. Advanced Adaptive Learning:
-      • Reinforcement Learning for Engagement.
-      • Contextual Re-Training.
-  4. More Natural Interactions & Emergent Behavior:
-      • Collaborative Multi-Bot Storytelling with shared story state.
-      • Conversational Interruptions & Turn-Taking.
-      • Simulated “Mistakes” and Corrections.
-  5. Multi-Modal Content Generation:
-      • Dynamic Visual & Audio Content.
-      • Adaptive Multimedia Integration.
-  6. Social Graph & Network Interactions:
-      • Community-Aware Behavior.
-      • Cross-Platform Interaction.
-
-Each bot’s persistent files are stored in its own directory (../bots/<bot_name>).
-
-Requirements: See requirements.txt. (May need additional libraries such as textblob.)
-"""
-
-# =============================================================================
-# Global Constants (Updated for new directory structure)
-# =============================================================================
-
-CONFIGS_DIR = os.path.join(Path(__file__).parent.parent, "configs")  # folder containing each bot's config file
-RATE_LIMIT_WAIT = 60         # seconds to wait when a rate limit is hit
-ME_CACHE_DURATION = 300      # seconds to cache authenticated user info in memory
+# Global constants
+CONFIGS_DIR = os.path.join(Path(__file__).parent.parent, "configs")
 TOKEN_EXPIRY_SECONDS = 90 * 24 * 3600  # Tokens expire in 90 days
 MAX_AUTH_RETRIES = 3
-
-# Filenames for conversation history and engagement metrics
 CONVO_HISTORY_FMT = "conversation_history_{}.json"
 ENGAGEMENT_METRICS_FMT = "engagement_metrics_{}.json"
-
-
-# =============================================================================
-# Bot Class Definition
-# =============================================================================
 
 class Bot:
     def __init__(self, name: str, config_path: str, port: int):
@@ -91,42 +42,19 @@ class Bot:
             os.makedirs(self.bot_dir)
             logging.info(f"✅ Created directory for bot '{self.name}': {self.bot_dir}")
 
-        # All persistence files will be stored inside self.bot_dir
+        # Persistence files
         self.token_file = os.path.join(self.bot_dir, f"token_{self.name}.json")
-        self.user_id_cache_file = os.path.join(self.bot_dir, f"user_id_cache_{self.name}.json")
-        self.bot_tweet_cache_file = os.path.join(self.bot_dir, f"bot_tweet_cache_{self.name}.json")
         self.convo_history_file = os.path.join(self.bot_dir, CONVO_HISTORY_FMT.format(self.name))
         self.engagement_metrics_file = os.path.join(self.bot_dir, ENGAGEMENT_METRICS_FMT.format(self.name))
         self.interaction_history_file = os.path.join(self.bot_dir, f"interaction_history_{self.name}.json")
+        self.mood_history_file = os.path.join(self.bot_dir, f"mood_history_{self.name}.json")
 
         self.config = {}
-        self.client = None
+        self.platform_adapters = {}
 
-        # OAuth-specific state
-        self.oauth_verifier = None
-        self.request_token = None
-
-        # Manual run counts
-        self.post_run_count = 1
-        self.comment_run_count = 1
-        self.reply_run_count = 1
-
-        # NEW: Additional run counts for new functionalities
-        self.dm_run_count = 1
-        self.story_run_count = 1
-
-        # In-memory caches
-        self.user_id_cache = {}
-        self.bot_tweet_cache = {"tweet_id": None, "timestamp": 0}
-        self.monitored_handles_last_ids = {}
-
-        # Scheduler for automated jobs
+        # Scheduler and Flask server
         self.scheduler = schedule.Scheduler()
         self.app = None
-
-        # Cached authenticated user info
-        self.cached_me = None
-        self.me_cache_timestamp = 0
 
         # Control flags and thread handles
         self.running = False
@@ -134,29 +62,22 @@ class Bot:
         self.flask_thread = None
         self.scheduler_thread = None
 
-        # Auto functions enabled flags
+        # Auto functions enabled flags (for post, comment, reply, etc.)
         self.auto_post_enabled = True
         self.auto_comment_enabled = True
         self.auto_reply_enabled = True
+        self.auto_cross_enabled = False
+        self.auto_trending_enabled = False
+        self.auto_dm_enabled = False
+        self.auto_story_enabled = False
 
-        # NEW: Additional auto flags
-        self.auto_cross_enabled = False  # cross-bot engagement
-        self.auto_trending_enabled = False  # trending topics engagement
-        self.auto_dm_enabled = False  # auto DM-checking
-        self.auto_story_enabled = False  # collaborative storytelling
-
-        # NEW: Original mood state (used as a summary)
+        # Mood and sentiment state
         self.mood_state = "neutral"
-
-        # NEW: For smoothing and momentum in sentiment analysis
         self.sentiment_history = []
         self.sentiment_window = 5
-
-        # NEW: Count consecutive forbidden errors to avoid looping
         self.consecutive_forbidden_count = 0
 
-        # NEW: Rich Personality & Emotional Modeling
-        # Default personality parameters inspired by the Big Five
+        # Personality and emotional state (for adaptive learning)
         self.personality = {
             "openness": 0.5,
             "conscientiousness": 0.5,
@@ -164,7 +85,6 @@ class Bot:
             "agreeableness": 0.5,
             "neuroticism": 0.5
         }
-        # Multi-dimensional emotional state
         self.emotions = {
             "excitement": 0.0,
             "anxiety": 0.0,
@@ -173,24 +93,20 @@ class Bot:
             "sadness": 0.0
         }
 
+    # =============================
+    # Universal Utility Functions
+    # =============================
     @staticmethod
-    def clean_tweet_text(text: str) -> str:
-        """Clean and truncate tweet text to 280 characters."""
+    def clean_text(text: str) -> str:
+        """Clean and truncate text to 280 characters."""
         cleaned = text.strip(" '\"")
         cleaned = re.sub(r'\n+', ' ', cleaned)
         return cleaned[:280]
 
     def validate_time(self, time_str: str, default: str) -> str:
-        """Validate a time string in HH:MM format; return the string if valid, otherwise return the default."""
         pattern = r"^\d{1,2}:\d{2}$"
-        if re.match(pattern, time_str):
-            return time_str
-        else:
-            return default
+        return time_str if re.match(pattern, time_str) else default
 
-    # -----------------------------
-    # TOKEN & CONFIG METHODS
-    # -----------------------------
     def save_token(self, token_data: dict) -> None:
         try:
             token_data["created_at"] = time.time()
@@ -198,7 +114,7 @@ class Bot:
                 json.dump(token_data, f)
             logging.info(f"✅ Bot {self.name}: Token saved successfully to {self.token_file}")
         except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error saving token: {str(e)}")
+            logging.error(f"❌ Bot {self.name}: Error saving token: {e}")
 
     def load_token(self) -> dict:
         if os.path.exists(self.token_file):
@@ -206,7 +122,7 @@ class Bot:
                 with open(self.token_file, "r") as f:
                     return json.load(f)
             except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error loading token: {str(e)}")
+                logging.error(f"❌ Bot {self.name}: Error loading token: {e}")
         return {}
 
     def call_openai_completion(self, model: str, messages: list, temperature: float,
@@ -223,11 +139,10 @@ class Bot:
                 presence_penalty=presence_penalty
             )
             raw_text = response.choices[0].message.content.strip()
-            # Inject conversational dynamics (interruptions and corrections)
             raw_text = self.add_conversational_dynamics(raw_text)
-            return Bot.clean_tweet_text(raw_text)
+            return Bot.clean_text(raw_text)
         except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error generating OpenAI completion: {str(e)}")
+            logging.error(f"❌ Bot {self.name}: Error generating OpenAI completion: {e}")
             return ""
 
     def load_config(self) -> None:
@@ -239,11 +154,10 @@ class Bot:
             with open(self.config_file, "r") as file:
                 self.config = yaml.safe_load(file)
             logging.info(f"✅ Bot {self.name}: Loaded config from {self.config_file}")
-            # If personality settings are provided in the config, update them
             if "personality" in self.config:
                 self.personality = self.config["personality"]
         except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error loading config file: {str(e)}")
+            logging.error(f"❌ Bot {self.name}: Error loading config file: {e}")
             self.config = {}
 
     def run_flask(self) -> None:
@@ -272,626 +186,17 @@ class Bot:
         logging.info(f"🚀 Bot {self.name}: Starting Flask server on port {self.port}")
         self.app.run(host="localhost", port=self.port, debug=False, use_reloader=False)
 
-    def authenticate(self):
-        """Authenticate with Twitter, using stored tokens or initiating OAuth flow."""
-        self.oauth_verifier = None
-        self.request_token = None
-        consumer_key = os.getenv(f"{self.name.upper()}_TWITTER_CONSUMER_KEY")
-        consumer_secret = os.getenv(f"{self.name.upper()}_TWITTER_CONSUMER_SECRET")
-        if not consumer_key or not consumer_secret:
-            logging.error(f"❌ Bot {self.name}: Twitter API keys not found in .env")
-            sys.exit(1)
-
-        for attempt in range(MAX_AUTH_RETRIES):
-            token_data = self.load_token()
-            if token_data:
-                try:
-                    client = tweepy.Client(
-                        consumer_key=consumer_key,
-                        consumer_secret=consumer_secret,
-                        access_token=token_data.get("access_token", ""),
-                        access_token_secret=token_data.get("access_token_secret", ""),
-                        wait_on_rate_limit=False
-                    )
-                    me = client.get_me()
-                    self.cached_me = me
-                    self.me_cache_timestamp = time.time()
-                    logging.info(f"✅ Bot {self.name}: Using stored authentication token")
-                    self.client = client
-                    return client
-                except tweepy.Unauthorized:
-                    logging.warning(f"⚠️ Bot {self.name}: Stored token invalid, starting fresh auth")
-                    if os.path.exists(self.token_file):
-                        os.remove(self.token_file)
-            auth = tweepy.OAuth1UserHandler(
-                consumer_key,
-                consumer_secret,
-                callback=f"http://localhost:{self.port}/callback"
-            )
-            try:
-                auth_url = auth.get_authorization_url()
-                self.request_token = auth.request_token
-                logging.info(f"🔗 Bot {self.name}: Authentication URL: {auth_url}")
-                print(f"\nBot {self.name}: Open this URL to authorize: {auth_url}\n")
-                while self.oauth_verifier is None:
-                    time.sleep(1)
-                access_token, access_token_secret = auth.get_access_token(self.oauth_verifier)
-                self.save_token({
-                    "access_token": access_token,
-                    "access_token_secret": access_token_secret
-                })
-                logging.info(f"✅ Bot {self.name}: New authentication token stored")
-                client = tweepy.Client(
-                    consumer_key=consumer_key,
-                    consumer_secret=consumer_secret,
-                    access_token=access_token,
-                    access_token_secret=access_token_secret,
-                    wait_on_rate_limit=False
-                )
-                me = client.get_me()
-                self.cached_me = me
-                self.me_cache_timestamp = time.time()
-                self.client = client
-                return client
-            except tweepy.TweepyException as e:
-                logging.error(f"❌ Bot {self.name}: Authentication failed: {str(e)}")
-                if attempt < MAX_AUTH_RETRIES - 1:
-                    logging.info(f"🔁 Bot {self.name}: Retrying auth...")
-                    time.sleep(2)
-                    continue
-                logging.error(f"❌ Bot {self.name}: Max auth attempts reached")
-                sys.exit(1)
-        return None
-
-    def get_cached_me(self):
-        if self.cached_me and (time.time() - self.me_cache_timestamp) < ME_CACHE_DURATION:
-            return self.cached_me
-        try:
-            me = self.client.get_me()
-            self.cached_me = me
-            self.me_cache_timestamp = time.time()
-            return me
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error refreshing authenticated user info: {e}")
-            return None
-
-    # -----------------------------
-    # USER ID CACHE
-    # -----------------------------
-    def load_user_id_cache(self):
-        if os.path.exists(self.user_id_cache_file):
-            try:
-                with open(self.user_id_cache_file, "r") as f:
-                    self.user_id_cache = json.load(f)
-                logging.info(f"✅ Bot {self.name}: Loaded user_id cache from {self.user_id_cache_file}")
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Could not load user_id cache: {e}")
-
-    def save_user_id_cache(self):
-        try:
-            with open(self.user_id_cache_file, "w") as f:
-                json.dump(self.user_id_cache, f)
-            logging.info(f"✅ Bot {self.name}: Saved user_id cache to {self.user_id_cache_file}")
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Could not save user_id cache: {e}")
-
-    def get_user_id(self, username: str):
-        username_lower = username.lower()
-        if username_lower in self.user_id_cache:
-            logging.info(f"🔄 Bot {self.name}: Using cached user_id for {username}: {self.user_id_cache[username_lower]}")
-            return self.user_id_cache[username_lower]
-        try:
-            response = self.client.get_user(username=username, user_auth=True)
-            if response and response.data:
-                user_id = response.data.id
-                self.user_id_cache[username_lower] = user_id
-                self.save_user_id_cache()
-                logging.info(f"🔗 Bot {self.name}: Fetched and cached user_id for {username}: {user_id}")
-                return user_id
-            else:
-                logging.warning(f"⚠️ Bot {self.name}: No data returned for username {username}")
-        except tweepy.TooManyRequests:
-            logging.warning(f"⚠️ Bot {self.name}: Rate limit reached while fetching user_id for {username}. Backing off...")
-            time.sleep(RATE_LIMIT_WAIT)
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error fetching user id for {username}: {e}")
-        return None
-
-    def get_user_ids_bulk(self, usernames: list):
-        usernames = [u for u in usernames if u.lower() not in self.user_id_cache]
-        if usernames:
-            try:
-                response = self.client.get_users(usernames=usernames, user_auth=True, user_fields=["id"])
-                if response and response.data:
-                    for user in response.data:
-                        self.user_id_cache[user.username.lower()] = user.id
-                    self.save_user_id_cache()
-                else:
-                    logging.warning(f"⚠️ Bot {self.name}: No data returned for bulk user lookup")
-            except tweepy.TooManyRequests:
-                logging.warning(f"⚠️ Bot {self.name}: Rate limit hit during bulk user lookup. Backing off...")
-                time.sleep(RATE_LIMIT_WAIT)
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error during bulk user lookup: {e}")
-        return {u: self.user_id_cache.get(u.lower()) for u in usernames}
-
-    # -----------------------------
-    # BOT TWEET CACHE
-    # -----------------------------
-    def load_bot_tweet_cache(self):
-        if os.path.exists(self.bot_tweet_cache_file):
-            try:
-                with open(self.bot_tweet_cache_file, "r") as f:
-                    self.bot_tweet_cache = json.load(f)
-                logging.info(f"✅ Bot {self.name}: Loaded bot tweet cache from {self.bot_tweet_cache_file}")
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Could not load bot tweet cache: {e}")
-
-    def save_bot_tweet_cache(self):
-        try:
-            with open(self.bot_tweet_cache_file, "w") as f:
-                json.dump(self.bot_tweet_cache, f)
-            logging.info(f"✅ Bot {self.name}: Saved bot tweet cache to {self.bot_tweet_cache_file}")
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Could not save bot tweet cache: {e}")
-
-    def get_bot_recent_tweet_id(self, cache_duration: int = 300):
-        current_time = time.time()
-        self.load_bot_tweet_cache()
-        if (self.bot_tweet_cache["tweet_id"] is not None and
-                (current_time - self.bot_tweet_cache["timestamp"]) < cache_duration):
-            logging.info(f"🔄 Bot {self.name}: Using cached bot tweet id.")
-            return self.bot_tweet_cache["tweet_id"]
-        try:
-            me = self.get_cached_me()
-            if not (me and me.data):
-                logging.error(f"❌ Bot {self.name}: Unable to retrieve authenticated user info.")
-                return None
-            response = self.client.get_users_tweets(
-                id=me.data.id,
-                max_results=5,
-                tweet_fields=["id"],
-                user_auth=True
-            )
-            if response and response.data:
-                tweet_id = response.data[0].id
-                self.bot_tweet_cache["tweet_id"] = tweet_id
-                self.bot_tweet_cache["timestamp"] = current_time
-                self.save_bot_tweet_cache()
-                logging.info(f"🔗 Bot {self.name}: Fetched and cached bot tweet id: {tweet_id}")
-                return tweet_id
-            else:
-                logging.warning(f"⚠️ Bot {self.name}: No recent tweets found.")
-        except tweepy.TooManyRequests:
-            logging.warning(f"⚠️ Bot {self.name}: Rate limit reached while fetching bot's recent tweet id. Backing off...")
-            time.sleep(RATE_LIMIT_WAIT)
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error fetching bot's recent tweet id: {e}")
-        return None
-
-    # -----------------------------
-    # EXTERNAL DATA FETCHING (news, weather, etc.)
-    # -----------------------------
-    def fetch_news(self, keyword: str = None) -> dict:
-        news_api_key = os.getenv("NEWS_API_KEY")
-        if not news_api_key:
-            logging.error(f"❌ Bot {self.name}: NEWS_API_KEY not found in .env")
-            return {"headline": "", "article": ""}
-        base_url = f"https://newsdata.io/api/1/latest?apikey={news_api_key}"
-        if keyword:
-            base_url += f"&q={keyword}"
-        try:
-            response = requests.get(base_url)
-            if response.status_code != 200:
-                logging.error(f"❌ Bot {self.name}: News API request failed: {response.status_code} {response.text}")
-                return {"headline": "", "article": ""}
-            data = response.json()
-            articles = data.get("results", [])
-            if articles:
-                article = articles[0]
-                headline = article.get("title", "")
-                article_text = article.get("description", "")
-                logging.info(f"🔗 Bot {self.name}: Fetched news headline: {headline}")
-                return {"headline": headline, "article": article_text}
-            else:
-                logging.info(f"⚠️ Bot {self.name}: No articles found for keyword: {keyword}")
-                return {"headline": "", "article": ""}
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error fetching news: {e}")
-            return {"headline": "", "article": ""}
-
-    def fetch_weather(self, location=""):
-        # Placeholder weather API simulation
-        weather_data = {"temperature": "20°C", "condition": "Sunny"}
-        logging.info(f"🔎 Bot {self.name}: Fetched weather data: {weather_data}")
-        return weather_data
-
-    def fetch_calendar_events(self):
-        # Placeholder for calendar events
-        events = [{"event": "Meeting", "time": "15:00"}]
-        logging.info(f"🔎 Bot {self.name}: Fetched calendar events: {events}")
-        return events
-
-    # -----------------------------
-    # PROMPT / TEXT GENERATION
-    # -----------------------------
+    # =============================
+    # Mood & Sentiment Modulation
+    # =============================
     def add_conversational_dynamics(self, text: str) -> str:
-        # Introduce random interruptions or self-corrections
         if random.random() < 0.1:
             text = "Uh-huh, " + text
         if random.random() < 0.05:
             text += " (Correction: Sorry, I misspoke!)"
         return text
 
-    def generate_tweet(self) -> str:
-        if not self.config:
-            logging.error(f"❌ Bot {self.name}: Configuration is empty or invalid.")
-            return ""
-        contexts = self.config.get("contexts", {})
-        if not contexts:
-            logging.error(f"❌ Bot {self.name}: No contexts found in config.")
-            return ""
-
-        random_context = random.choice(list(contexts.keys()))
-        logging.info(f"🔎 Bot {self.name}: Selected context: {random_context}")
-        prompt_settings = contexts[random_context].get("prompt", {})
-        if not prompt_settings:
-            logging.error(f"❌ Bot {self.name}: No prompt data found for context '{random_context}'.")
-            return ""
-
-        system_prompt = prompt_settings.get("system", "")
-        user_prompt = prompt_settings.get("user", "")
-        model = prompt_settings.get("model", "gpt-4o")
-        temperature = prompt_settings.get("temperature", 1)
-        max_tokens = prompt_settings.get("max_tokens", 16384)
-        top_p = prompt_settings.get("top_p", 1.0)
-        frequency_penalty = prompt_settings.get("frequency_penalty", 0.8)
-        presence_penalty = prompt_settings.get("presence_penalty", 0.1)
-
-        # Append conversation history (if any)
-        conversation = self.load_conversation_history()
-        if conversation:
-            user_prompt += "\nPrevious conversation: " + conversation
-
-        # Optionally include news, weather, calendar, personality info
-        if prompt_settings.get("include_news", False):
-            news_keyword = prompt_settings.get("news_keyword", None)
-            news_data = self.fetch_news(news_keyword)
-            template = Template(user_prompt)
-            user_prompt = template.render(news_headline=news_data["headline"],
-                                          news_article=news_data["article"],
-                                          mood_state=self.mood_state,
-                                          personality=self.personality)
-        elif prompt_settings.get("include_weather", False):
-            weather = self.fetch_weather()
-            template = Template(user_prompt)
-            user_prompt = template.render(weather=weather,
-                                          mood_state=self.mood_state,
-                                          personality=self.personality)
-        else:
-            template = Template(user_prompt)
-            user_prompt = template.render(mood_state=self.mood_state, personality=self.personality)
-
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        if user_prompt:
-            messages.append({"role": "user", "content": user_prompt})
-
-        tweet_text = self.call_openai_completion(
-            model, messages, temperature, max_tokens, top_p, frequency_penalty, presence_penalty
-        )
-
-        # Save the generated tweet to conversation history
-        self.append_conversation_history(tweet_text)
-        return self.clean_tweet_text(tweet_text) if tweet_text else ""
-
-    def handle_forbidden_error(self, error) -> bool:
-        """
-        Handler for 403 Forbidden errors when posting tweets.
-        Increments a counter and, if the threshold is exceeded,
-        disables auto-posting to prevent an infinite loop.
-        """
-        self.consecutive_forbidden_count += 1
-        logging.error(f"❌ Bot {self.name}: Tweet forbidden by Twitter. (Forbidden count: {self.consecutive_forbidden_count})")
-        if self.consecutive_forbidden_count >= 3:
-            logging.error(f"❌ Bot {self.name}: Repeated forbidden errors encountered. Disabling auto-posting temporarily.")
-            self.auto_post_enabled = False
-        return False
-
-    def post_tweet(self) -> bool:
-        tweet = self.generate_tweet()
-        if not tweet:
-            logging.error(f"❌ Bot {self.name}: No tweet generated")
-            return False
-        try:
-            self.client.create_tweet(text=tweet)
-            logging.info(f"✅ Bot {self.name}: Tweet posted successfully: {tweet}")
-            self.consecutive_forbidden_count = 0  # reset on success
-            return True
-        except tweepy.TweepyException as e:
-            if "403" in str(e):
-                return self.handle_forbidden_error(e)
-            else:
-                logging.error(f"❌ Bot {self.name}: Error posting tweet: {str(e)}")
-                return False
-
-    # -----------------------------
-    # SCHEDULED TASKS (daily tweet, comment, reply, etc.)
-    # -----------------------------
-    def daily_tweet_job(self):
-        logging.info(f"⏰ Bot {self.name}: Attempting to post a tweet...")
-        success = False
-        for _ in range(MAX_AUTH_RETRIES):
-            if self.post_tweet():
-                success = True
-                break
-            time.sleep(2)
-        if success:
-            logging.info(f"✅ Bot {self.name}: Tweet posted at {datetime.datetime.now(pytz.utc)}")
-        else:
-            logging.error(f"❌ Bot {self.name}: Failed to post tweet after multiple attempts")
-
-    def daily_comment(self):
-        logging.info(f"🔎 Bot {self.name}: Checking monitored handles for new tweets...")
-        config = self.config
-        if not config:
-            logging.warning(f"❌ Bot {self.name}: Config empty/invalid.")
-            return
-        monitored_handles = config.get("monitored_handles", {})
-        handles = [handle for handle in monitored_handles.keys() if handle.lower() != "last_id"]
-        self.get_user_ids_bulk(handles)
-        for handle_name in handles:
-            handle_data = monitored_handles.get(handle_name, {})
-            user_id = self.get_user_id(handle_name)
-            if not user_id:
-                logging.warning(f"❌ Bot {self.name}: Could not fetch user_id for '{handle_name}'. Skipping.")
-                continue
-            last_id = self.monitored_handles_last_ids.get(handle_name, None)
-            try:
-                tweets_response = self.client.get_users_tweets(
-                    id=user_id,
-                    since_id=last_id,
-                    exclude=["retweets", "replies"],
-                    max_results=5,
-                    tweet_fields=["id", "text"],
-                    user_auth=True
-                )
-            except tweepy.TooManyRequests:
-                logging.warning(f"⚠️ Bot {self.name}: Rate limit hit while fetching tweets for '{handle_name}'. Backing off...")
-                time.sleep(RATE_LIMIT_WAIT)
-                break
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error fetching tweets for '{handle_name}': {str(e)}")
-                continue
-            if not tweets_response or not tweets_response.data:
-                logging.info(f"📭 Bot {self.name}: No new tweets from {handle_name}.")
-                continue
-
-            newest_tweet = tweets_response.data[0]
-            if last_id and newest_tweet.id <= last_id:
-                logging.info(f"📭 Bot {self.name}: Already commented or not newer than {last_id}. Skipping.")
-                continue
-            prompt_data = handle_data.get("response_prompt", {})
-            if not prompt_data:
-                logging.warning(f"❌ Bot {self.name}: No response_prompt for '{handle_name}'. Skipping.")
-                continue
-
-            system_prompt = prompt_data.get("system", "")
-            user_prompt_template = prompt_data.get("user", "")
-            model = prompt_data.get("model", "gpt-4o")
-            temperature = prompt_data.get("temperature", 1)
-            max_tokens = prompt_data.get("max_tokens", 16384)
-            top_p = prompt_data.get("top_p", 1.0)
-            frequency_penalty = prompt_data.get("frequency_penalty", 0.8)
-            presence_penalty = prompt_data.get("presence_penalty", 0.1)
-
-            template = Template(user_prompt_template)
-            filled_prompt = template.render(tweet_text=newest_tweet.text, mood_state=self.mood_state)
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": filled_prompt})
-
-            reply = self.call_openai_completion(model, messages, temperature, max_tokens, top_p,
-                                                frequency_penalty, presence_penalty)
-            if reply:
-                try:
-                    self.client.create_tweet(text=reply, in_reply_to_tweet_id=newest_tweet.id, user_auth=True)
-                    logging.info(f"✅ Bot {self.name}: Replied to tweet {newest_tweet.id} by {handle_name}: {reply}")
-                    self.monitored_handles_last_ids[handle_name] = newest_tweet.id
-                except Exception as e:
-                    logging.error(f"❌ Bot {self.name}: Error replying to tweet {newest_tweet.id}: {str(e)}")
-            else:
-                logging.error(f"❌ Bot {self.name}: Failed to generate reply for tweet {newest_tweet.id}")
-
-    def daily_comment_job(self):
-        logging.info(f"⏰ Bot {self.name}: Attempting to auto-comment (scheduled).")
-        self.daily_comment()
-
-    def daily_comment_reply(self):
-        logging.info(f"🔎 Bot {self.name}: Checking for replies to my tweet...")
-        config = self.config
-        if not config:
-            logging.warning(f"❌ Bot {self.name}: Config empty/invalid.")
-            return
-        reply_handles = config.get("reply_handles", {})
-        if not reply_handles:
-            logging.warning(f"❌ Bot {self.name}: No reply handles specified in config. Skipping.")
-            return
-        self.get_user_ids_bulk(list(reply_handles.keys()))
-        for handle_name, handle_data in reply_handles.items():
-            user_id = self.get_user_id(handle_name)
-            if not user_id:
-                logging.warning(f"❌ Bot {self.name}: Could not fetch user_id for '{handle_name}'. Skipping.")
-                continue
-            try:
-                auth_user = self.get_cached_me()
-                if not (auth_user and auth_user.data):
-                    logging.error(f"❌ Bot {self.name}: Failed to retrieve authenticated user info.")
-                    return
-                recent_tweet_id = self.get_bot_recent_tweet_id()
-                if not recent_tweet_id:
-                    logging.info(f"📭 Bot {self.name}: No recent tweet found.")
-                    continue
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error retrieving bot info: {e}")
-                continue
-
-            try:
-                replies = self.client.search_recent_tweets(
-                    query=f"to:{auth_user.data.username}",
-                    since_id=recent_tweet_id,
-                    max_results=10,
-                    tweet_fields=["author_id", "text"],
-                    expansions="author_id",
-                    user_auth=True
-                )
-            except tweepy.TooManyRequests:
-                logging.warning(f"⚠️ Bot {self.name}: Rate limit hit while fetching replies. Backing off...")
-                time.sleep(RATE_LIMIT_WAIT)
-                return
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error fetching replies: {str(e)}")
-                return
-
-            if not replies or not replies.data:
-                logging.info(f"📭 Bot {self.name}: No replies found for tweet {recent_tweet_id}.")
-                continue
-
-            author_users = {user.id: user.username.lower() for user in replies.includes.get("users", [])}
-            for reply in replies.data:
-                reply_text = reply.text.strip()
-                author_handle = author_users.get(reply.author_id, "").lower()
-                if author_handle != handle_name.lower():
-                    logging.info(f"👀 Bot {self.name}: Ignoring reply from @{author_handle}.")
-                    continue
-                logging.info(f"📢 Bot {self.name}: Detected reply from @{handle_name}: {reply_text}")
-
-                prompt_data = handle_data.get("response_prompt", {})
-                if not prompt_data:
-                    logging.warning(f"❌ Bot {self.name}: No response_prompt for '{handle_name}'. Skipping.")
-                    continue
-
-                system_prompt = prompt_data.get("system", "")
-                user_prompt_template = prompt_data.get("user", "")
-                model = prompt_data.get("model", "gpt-4o")
-                temperature = prompt_data.get("temperature", 1)
-                max_tokens = prompt_data.get("max_tokens", 16384)
-                top_p = prompt_data.get("top_p", 1.0)
-                frequency_penalty = prompt_data.get("frequency_penalty", 0.8)
-                presence_penalty = prompt_data.get("presence_penalty", 0.1)
-
-                try:
-                    tweet_response = self.client.get_tweet(recent_tweet_id, tweet_fields=["text"], user_auth=True)
-                    bot_tweet_text = tweet_response.data.text if tweet_response and tweet_response.data else ""
-                except Exception as e:
-                    bot_tweet_text = ""
-                    logging.warning(f"❌ Bot {self.name}: Could not fetch my tweet text: {e}")
-
-                template = Template(user_prompt_template)
-                filled_prompt = template.render(comment_text=reply_text,
-                                                tweet_text=bot_tweet_text,
-                                                mood_state=self.mood_state)
-                messages = []
-                if system_prompt:
-                    messages.append({"role": "system", "content": system_prompt})
-                messages.append({"role": "user", "content": filled_prompt})
-
-                response_text = self.call_openai_completion(model, messages, temperature, max_tokens, top_p,
-                                                            frequency_penalty, presence_penalty)
-                if response_text:
-                    try:
-                        self.client.create_tweet(text=response_text, in_reply_to_tweet_id=reply.id, user_auth=True)
-                        logging.info(f"✅ Bot {self.name}: Replied to @{handle_name} on tweet {reply.id}: {response_text}")
-                    except Exception as e:
-                        logging.error(f"❌ Bot {self.name}: Error replying for tweet {reply.id}: {e}")
-                else:
-                    logging.error(f"❌ Bot {self.name}: Failed to generate reply for tweet {reply.id}")
-
-    def daily_comment_reply_job(self):
-        logging.info(f"⏰ Bot {self.name}: Attempting to auto-reply (scheduled).")
-        self.daily_comment_reply()
-
-    # -----------------------------
-    # NEW FUNCTIONALITY: Cross-Bot Engagement
-    # -----------------------------
-    def cross_bot_engagement(self):
-        """
-        Engage with tweets from fellow bots.
-        Looks for tweets from usernames listed under 'bot_network' in the config
-        and replies or retweets them to simulate conversation.
-        """
-        bot_network = self.config.get("bot_network", [])
-        if not bot_network:
-            logging.info(f"ℹ️ Bot {self.name}: No bot network defined for cross engagement.")
-            return
-        query = " OR ".join([f"from:{username}" for username in bot_network])
-        try:
-            results = self.client.search_recent_tweets(
-                query=query, max_results=5, tweet_fields=["id", "text"], user_auth=True
-            )
-            if results and results.data:
-                for tweet in results.data:
-                    reply_text = f"@{tweet.id} Interesting point!"
-                    try:
-                        self.client.create_tweet(text=reply_text, in_reply_to_tweet_id=tweet.id, user_auth=True)
-                        logging.info(f"✅ Bot {self.name}: Cross-engaged with tweet {tweet.id} from network.")
-                    except Exception as e:
-                        logging.error(f"❌ Bot {self.name}: Error during cross engagement on tweet {tweet.id}: {e}")
-            else:
-                logging.info(f"ℹ️ Bot {self.name}: No network tweets found for cross engagement.")
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error during cross engagement: {e}")
-
-    def run_cross_engagement_job(self):
-        logging.info(f"⏰ Bot {self.name}: Running cross-bot engagement job.")
-        self.cross_bot_engagement()
-
-    # -----------------------------
-    # PERSISTENT CONVERSATION MEMORY
-    # -----------------------------
-    def load_conversation_history(self) -> str:
-        if os.path.exists(self.convo_history_file):
-            try:
-                with open(self.convo_history_file, "r") as f:
-                    return f.read()
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error loading conversation history: {e}")
-        return ""
-
-    def append_conversation_history(self, text: str):
-        try:
-            with open(self.convo_history_file, "a") as f:
-                f.write(text + "\n")
-            logging.info(f"✅ Bot {self.name}: Appended new text to conversation history.")
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error appending to conversation history: {e}")
-
-    def load_interaction_history(self) -> list:
-        if os.path.exists(self.interaction_history_file):
-            try:
-                with open(self.interaction_history_file, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error loading interaction history: {e}")
-        return []
-
-    def append_interaction_history(self, entry: dict):
-        history = self.load_interaction_history()
-        history.append(entry)
-        try:
-            with open(self.interaction_history_file, "w") as f:
-                json.dump(history, f)
-            logging.info(f"✅ Bot {self.name}: Appended new interaction history entry.")
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error appending to interaction history: {e}")
-
-    # -----------------------------
-    # MOOD & SENTIMENT MODULATION
-    # -----------------------------
     def analyze_sentiment(self, text: str) -> float:
-        """Return sentiment polarity (-1 to 1) using TextBlob."""
         try:
             blob = TextBlob(text)
             return blob.sentiment.polarity
@@ -900,10 +205,6 @@ class Bot:
             return 0.0
 
     def get_mood_thresholds(self):
-        """
-        Retrieve mood thresholds from the YAML configuration if available,
-        otherwise return default thresholds.
-        """
         default_thresholds = {
             "elated": 0.5,
             "uplifted": 0.3,
@@ -1019,9 +320,8 @@ class Bot:
             "previous_mood": previous_mood,
             "new_mood": new_mood
         }
-        mood_history_file = os.path.join(self.bot_dir, f"mood_history_{self.name}.json")
         try:
-            with open(mood_history_file, "a", encoding="utf-8") as f:
+            with open(self.mood_history_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
             logging.info(f"✅ Bot {self.name}: Logged mood transition at {entry['timestamp']}")
         except Exception as e:
@@ -1029,10 +329,9 @@ class Bot:
 
     def load_mood_history_entries(self) -> list:
         entries = []
-        mood_history_file = os.path.join(self.bot_dir, f"mood_history_{self.name}.json")
-        if os.path.exists(mood_history_file):
+        if os.path.exists(self.mood_history_file):
             try:
-                with open(mood_history_file, "r", encoding="utf-8") as f:
+                with open(self.mood_history_file, "r", encoding="utf-8") as f:
                     for line in f:
                         if line.strip():
                             entries.append(json.loads(line))
@@ -1041,255 +340,77 @@ class Bot:
                 logging.error(f"❌ Bot {self.name}: Error loading mood history: {e}")
         return entries
 
-    # -----------------------------
-    # TRENDING TOPICS ENGAGEMENT
-    # -----------------------------
-    def fetch_trending_topics(self) -> list:
-        trending = ["#AI", "#OpenAI", "#TechNews", "#Python"]
-        logging.info(f"🔎 Bot {self.name}: Fetched trending topics: {', '.join(trending)}")
-        return trending
+    # =============================
+    # Scheduling & Wrapper Methods
+    # (These call the corresponding methods on each platform adapter)
+    # =============================
+    def add_platform_adapter(self, platform: str, adapter: BasePlatformAdapter):
+        self.platform_adapters[platform.lower()] = adapter
+        logging.info(f"✅ Bot {self.name}: Added adapter for platform '{platform}'.")
 
-    def run_trending_engagement(self):
-        trending = self.fetch_trending_topics()
-        if not trending:
-            logging.info(f"ℹ️ Bot {self.name}: No trending topics available.")
-            return
-        topic = random.choice(trending)
-        prompt = (f"Write an insightful tweet about the trending topic {topic}. "
-                  f"Current mood: {self.mood_state}. Personality: {self.personality}")
-        messages = [{"role": "user", "content": prompt}]
-        tweet_text = self.call_openai_completion("gpt-4o", messages, 1, 100, 1.0, 0.8, 0.1)
-        if tweet_text:
-            try:
-                self.client.create_tweet(text=tweet_text)
-                logging.info(f"✅ Bot {self.name}: Tweeted about trending topic {topic}: {tweet_text}")
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error tweeting trending topic: {e}")
-
-    # -----------------------------
-    # DIRECT MESSAGING (DM)
-    # -----------------------------
-    def send_dm(self, recipient_username: str, message: str):
-        """
-        Placeholder DM sending method.
-        """
-        try:
-            logging.info(f"✅ Bot {self.name}: Sent DM to @{recipient_username}: {message}")
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error sending DM: {e}")
-
-    def check_dms(self):
-        """
-        Placeholder for checking new direct messages.
-        """
-        try:
-            logging.info(f"🔎 Bot {self.name}: Checked DMs – no new messages found.")
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error checking DMs: {e}")
-
-    def run_dm_job(self):
-        logging.info(f"⏰ Bot {self.name}: Running DM check job.")
-        self.check_dms()
-
-    # -----------------------------
-    # COLLABORATIVE STORYTELLING
-    # -----------------------------
-    def load_shared_story_state(self):
-        shared_file = os.path.join(Path(__file__).parent.parent, "shared", "story_state.json")
-        if os.path.exists(shared_file):
-            try:
-                with open(shared_file, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error loading shared story state: {e}")
-        return {"story": ""}
-
-    def update_shared_story_state(self, new_content: str):
-        shared_file = os.path.join(Path(__file__).parent.parent, "shared", "story_state.json")
-        state = self.load_shared_story_state()
-        state["story"] += "\n" + new_content
-        try:
-            with open(shared_file, "w") as f:
-                json.dump(state, f)
-            logging.info(f"✅ Bot {self.name}: Updated shared story state.")
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error updating shared story state: {e}")
-
-    def run_collaborative_storytelling(self):
-        shared_state = self.load_shared_story_state().get("story", "")
-        prompt = (f"Continue the collaborative story with a new tweet. "
-                  f"Current mood: {self.mood_state}. Include a plot twist. "
-                  f"Previous story: {shared_state}")
-        messages = [{"role": "user", "content": prompt}]
-        story_tweet = self.call_openai_completion("gpt-4o", messages, 1, 150, 1.0, 0.8, 0.1)
-        if story_tweet:
-            try:
-                self.client.create_tweet(text=story_tweet)
-                logging.info(f"✅ Bot {self.name}: Posted a collaborative storytelling tweet: {story_tweet}")
-                self.append_conversation_history(story_tweet)
-                self.update_shared_story_state(story_tweet)
-            except Exception as e:
-                logging.error(f"❌ Bot {self.name}: Error posting storytelling tweet: {e}")
-
-    # -----------------------------
-    # VISUAL/MULTIMEDIA ENHANCEMENTS
-    # -----------------------------
-    def generate_image(self, prompt: str) -> str:
-        """
-        Placeholder image-generation method.
-        """
-        image_url = "https://via.placeholder.com/500.png?text=Generated+Image"
-        logging.info(f"🔗 Bot {self.name}: Generated image for prompt '{prompt}': {image_url}")
-        return image_url
-
-    def generate_audio(self, prompt: str) -> str:
-        """
-        Placeholder audio-generation method.
-        """
-        audio_url = "https://via.placeholder.com/audio_clip.mp3?text=Generated+Audio"
-        logging.info(f"🔗 Bot {self.name}: Generated audio for prompt '{prompt}': {audio_url}")
-        return audio_url
-
-    def post_tweet_with_image(self):
-        tweet = self.generate_tweet()
-        if not tweet:
-            logging.error(f"❌ Bot {self.name}: No tweet generated for image tweet")
-            return False
-        image_prompt = self.config.get("image_prompt", f"Generate an image for tweet: {tweet}")
-        image_url = self.generate_image(image_prompt)
-        tweet_with_image = tweet + f"\nImage: {image_url}"
-        # Adaptive Multimedia Integration: If engagement is high, add an audio clip.
-        metrics = self.track_engagement_metrics()
-        if metrics["likes"] > 75:
-            audio_url = self.generate_audio("Audio for tweet: " + tweet)
-            tweet_with_image += f"\nAudio: {audio_url}"
-        try:
-            self.client.create_tweet(text=tweet_with_image)
-            logging.info(f"✅ Bot {self.name}: Tweet with image (and possibly audio) posted successfully.")
-            return True
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error posting tweet with image: {e}")
-            return False
-
-    # -----------------------------
-    # FEEDBACK LOOP & ADAPTIVE LEARNING
-    # -----------------------------
-    def track_engagement_metrics(self):
-        """
-        Track engagement metrics for the most recent tweet (simulation).
-        """
-        metrics = {"likes": random.randint(0, 100), "retweets": random.randint(0, 50)}
-        try:
-            with open(self.engagement_metrics_file, "w") as f:
-                json.dump(metrics, f)
-            logging.info(f"✅ Bot {self.name}: Updated engagement metrics: {metrics}")
-        except Exception as e:
-            logging.error(f"❌ Bot {self.name}: Error saving engagement metrics: {e}")
-        return metrics
-
-    def adaptive_tune(self):
-        metrics = self.track_engagement_metrics()
-        if metrics["likes"] > 50:
-            new_temp = max(0.5, 1 - (metrics["likes"] / 200))
-        else:
-            new_temp = min(1.5, 1 + (50 - metrics["likes"]) / 100)
-        logging.info(f"🔄 Bot {self.name}: Adaptive tuning set temperature to {new_temp:.2f} based on engagement.")
-        self.reinforcement_learning_update()
-
-    def reinforcement_learning_update(self):
-        metrics = self.track_engagement_metrics()
-        if metrics["likes"] > 50:
-            self.personality["extraversion"] = min(1.0, self.personality["extraversion"] + 0.05)
-        else:
-            self.personality["extraversion"] = max(0.0, self.personality["extraversion"] - 0.05)
-        logging.info(f"🔄 Bot {self.name}: Updated personality via reinforcement learning: {self.personality}")
-
-    def contextual_retraining(self):
-        logging.info(f"🔄 Bot {self.name}: Contextual re-training executed based on conversation and engagement history.")
-
-    # -----------------------------
-    # MONITORING & ANALYTICS DASHBOARD
-    # -----------------------------
-    def show_dashboard(self):
-        now = datetime.datetime.now()
-        dashboard = [f"--- Dashboard for Bot {self.name} ---"]
-        dashboard.append(f"Status: {self.get_status()}")
-        dashboard.append(f"Mood: {self.mood_state}")
-        dashboard.append(f"Personality: {self.personality}")
-        for job in self.scheduler.jobs:
-            if job.next_run:
-                dashboard.append(f"Job {job.tags} scheduled at {job.next_run.strftime('%Y-%m-%d %H:%M:%S')}")
-        if os.path.exists(self.engagement_metrics_file):
-            try:
-                with open(self.engagement_metrics_file, "r") as f:
-                    metrics = json.load(f)
-                dashboard.append(f"Last Tweet - Likes: {metrics.get('likes', 0)}, Retweets: {metrics.get('retweets', 0)}")
-            except Exception as e:
-                dashboard.append("Engagement metrics unavailable.")
-        else:
-            dashboard.append("No engagement metrics recorded yet.")
-        print("\n".join(dashboard))
-        logging.info(f"✅ Bot {self.name}: Displayed dashboard.")
-
-    # -----------------------------
-    # SCHEDULING & WRAPPER METHODS
-    # -----------------------------
-    def tweet_job_wrapper(self):
-        self.daily_tweet_job()
-        self.scheduler.clear("randomized_tweet")
+    def post_job_wrapper(self):
+        for adapter in self.platform_adapters.values():
+            adapter.post()
+        self.scheduler.clear("randomized_post")
         if self.auto_post_enabled:
-            self.schedule_next_tweet_job()
+            self.schedule_next_post_job()
 
     def comment_job_wrapper(self):
-        self.daily_comment_job()
+        for adapter in self.platform_adapters.values():
+            adapter.comment()
         self.scheduler.clear("randomized_comment")
         if self.auto_comment_enabled:
             self.schedule_next_comment_job()
 
     def reply_job_wrapper(self):
-        self.daily_comment_reply_job()
+        for adapter in self.platform_adapters.values():
+            adapter.reply()
         self.scheduler.clear("randomized_reply")
         if self.auto_reply_enabled:
             self.schedule_next_reply_job()
 
     def cross_job_wrapper(self):
-        self.run_cross_engagement_job()
+        for adapter in self.platform_adapters.values():
+            adapter.cross_engage()
         self.scheduler.clear("cross_engagement")
         if self.auto_cross_enabled:
             self.scheduler.every(1).hours.do(self.cross_job_wrapper).tag("cross_engagement")
-            logging.info(f"Bot {self.name}: Next cross-bot engagement scheduled in 1 hour.")
+            logging.info(f"Bot {self.name}: Next cross-platform engagement scheduled in 1 hour.")
 
     def trending_job_wrapper(self):
-        self.run_trending_engagement()
+        for adapter in self.platform_adapters.values():
+            adapter.trending_engage()
         self.scheduler.clear("trending_engagement")
         if self.auto_trending_enabled:
             self.scheduler.every().day.at("11:00").do(self.trending_job_wrapper).tag("trending_engagement")
             logging.info(f"Bot {self.name}: Next trending engagement scheduled at 11:00.")
 
     def dm_job_wrapper(self):
-        self.run_dm_job()
+        for adapter in self.platform_adapters.values():
+            adapter.check_dms()
         self.scheduler.clear("dm_job")
         if self.auto_dm_enabled:
             self.scheduler.every(30).minutes.do(self.dm_job_wrapper).tag("dm_job")
             logging.info(f"Bot {self.name}: Next DM check scheduled in 30 minutes.")
 
     def story_job_wrapper(self):
-        self.run_collaborative_storytelling()
+        for adapter in self.platform_adapters.values():
+            adapter.story()
         self.scheduler.clear("story_job")
         if self.auto_story_enabled:
             self.scheduler.every().day.at("16:00").do(self.story_job_wrapper).tag("story_job")
-            logging.info(f"Bot {self.name}: Next storytelling tweet scheduled at 16:00.")
+            logging.info(f"Bot {self.name}: Next collaborative storytelling scheduled at 16:00.")
 
-    def schedule_next_tweet_job(self):
+    def schedule_next_post_job(self):
         if not self.auto_post_enabled:
             return
         rng = random.Random()
-        rng.seed(f"{self.name}_tweet_{time.time()}")
-        tweet_times = self.config.get("schedule", {}).get("tweet_times", ["12:00", "18:00"])
-        random_tweet_time = rng.choice(tweet_times)
-        random_tweet_time = self.validate_time(random_tweet_time, "12:00")
-        self.scheduler.every().day.at(random_tweet_time).do(self.tweet_job_wrapper).tag("randomized_tweet")
-        logging.info(f"Bot {self.name}: Next tweet scheduled at {random_tweet_time}")
+        rng.seed(f"{self.name}_post_{time.time()}")
+        post_times = self.config.get("schedule", {}).get("post_times", ["12:00", "18:00"])
+        random_post_time = rng.choice(post_times)
+        random_post_time = self.validate_time(random_post_time, "12:00")
+        self.scheduler.every().day.at(random_post_time).do(self.post_job_wrapper).tag("randomized_post")
+        logging.info(f"Bot {self.name}: Next post scheduled at {random_post_time}")
 
     def schedule_next_comment_job(self):
         if not self.auto_comment_enabled:
@@ -1314,12 +435,12 @@ class Bot:
         logging.info(f"Bot {self.name}: Next reply scheduled at {random_reply_time}")
 
     def randomize_schedule(self):
-        self.schedule_next_tweet_job()
+        self.schedule_next_post_job()
         self.schedule_next_comment_job()
         self.schedule_next_reply_job()
         if self.auto_cross_enabled:
             self.scheduler.every(1).hours.do(self.cross_job_wrapper).tag("cross_engagement")
-            logging.info(f"Bot {self.name}: Cross-bot engagement scheduled every hour.")
+            logging.info(f"Bot {self.name}: Cross-platform engagement scheduled every hour.")
         if self.auto_trending_enabled:
             self.scheduler.every().day.at("11:00").do(self.trending_job_wrapper).tag("trending_engagement")
             logging.info(f"Bot {self.name}: Trending engagement scheduled at 11:00 daily.")
@@ -1340,9 +461,9 @@ class Bot:
             self.scheduler.run_pending()
             time.sleep(1)
 
-    # -----------------------------
-    # START / STOP
-    # -----------------------------
+    # =============================
+    # START / STOP & Console Commands
+    # =============================
     def start(self):
         if self.running:
             logging.info(f"Bot {self.name} is already running.")
@@ -1352,16 +473,7 @@ class Bot:
             self.flask_thread = threading.Thread(target=self.run_flask, daemon=True)
             self.flask_thread.start()
             time.sleep(1)
-        self.authenticate()
-        self.load_user_id_cache()
-        self.load_bot_tweet_cache()
-        self.auto_post_enabled = True
-        self.auto_comment_enabled = True
-        self.auto_reply_enabled = True
-        self.auto_cross_enabled = False
-        self.auto_trending_enabled = False
-        self.auto_dm_enabled = False
-        self.auto_story_enabled = False
+        self.load_config()
         self.randomize_schedule()
         self.scheduler_thread = threading.Thread(target=self.start_scheduler, daemon=True)
         self.scheduler_thread.start()
@@ -1398,9 +510,6 @@ class Bot:
         seconds = int(remaining % 60)
         return f"Token will expire in {days}d {hours}h {minutes}m {seconds}s."
 
-    # -----------------------------
-    # CONSOLE COMMAND PROCESSING
-    # -----------------------------
     def process_console_command(self, cmd: str):
         if cmd == "start":
             self.start()
@@ -1409,7 +518,6 @@ class Bot:
         elif cmd == "new auth":
             if os.path.exists(self.token_file):
                 os.remove(self.token_file)
-                self.cached_me = None
                 logging.info(f"✅ Bot {self.name}: Token file removed. Bot will reauthenticate on next startup.")
                 print("Token file removed. Bot will reauthenticate on next startup.")
             else:
@@ -1418,17 +526,17 @@ class Bot:
         elif cmd == "auth age":
             print(self.get_auth_age())
         elif cmd.startswith("run post"):
-            logging.info(f"🚀 Bot {self.name}: 'run post' command received. Posting tweet {self.post_run_count} time(s).")
+            logging.info(f"🚀 Bot {self.name}: 'run post' command received. Posting on all platforms {self.post_run_count} time(s).")
             for _ in range(self.post_run_count):
-                self.daily_tweet_job()
+                self.post_job_wrapper()
         elif cmd.startswith("run comment"):
-            logging.info(f"🚀 Bot {self.name}: 'run comment' command received. Commenting {self.comment_run_count} time(s).")
+            logging.info(f"🚀 Bot {self.name}: 'run comment' command received. Commenting on all platforms {self.comment_run_count} time(s).")
             for _ in range(self.comment_run_count):
-                self.daily_comment_job()
+                self.comment_job_wrapper()
         elif cmd.startswith("run reply"):
-            logging.info(f"🚀 Bot {self.name}: 'run reply' command received. Replying {self.reply_run_count} time(s).")
+            logging.info(f"🚀 Bot {self.name}: 'run reply' command received. Replying on all platforms {self.reply_run_count} time(s).")
             for _ in range(self.reply_run_count):
-                self.daily_comment_reply_job()
+                self.reply_job_wrapper()
         elif cmd.startswith("set post count "):
             try:
                 value = int(cmd.split("set post count ")[1])
@@ -1491,9 +599,11 @@ class Bot:
                     else:
                         system_prompt = prompt_settings.get("system", "")
                         user_prompt = prompt_settings.get("user", "")
+                        # For contexts that include news, delegate fetching to a specific adapter (e.g. Twitter)
                         if prompt_settings.get("include_news", False):
                             news_keyword = prompt_settings.get("news_keyword", None)
-                            news_data = self.fetch_news(news_keyword)
+                            # Here we assume the "twitter" adapter is available to fetch news
+                            news_data = self.platform_adapters["twitter"].fetch_news(news_keyword)
                             template = Template(user_prompt)
                             user_prompt = template.render(news_headline=news_data["headline"],
                                                           news_article=news_data["article"],
@@ -1524,9 +634,9 @@ class Bot:
             self.re_randomize_schedule()
         elif cmd == "new random post":
             logging.info(f"🚀 Bot {self.name}: Scheduling new random time for post.")
-            self.scheduler.clear("randomized_tweet")
+            self.scheduler.clear("randomized_post")
             if self.auto_post_enabled:
-                self.schedule_next_tweet_job()
+                self.schedule_next_post_job()
         elif cmd == "new random comment":
             logging.info(f"🚀 Bot {self.name}: Scheduling new random time for comment.")
             self.scheduler.clear("randomized_comment")
@@ -1539,7 +649,7 @@ class Bot:
                 self.schedule_next_reply_job()
         elif cmd == "stop post":
             if self.auto_post_enabled:
-                self.scheduler.clear("randomized_tweet")
+                self.scheduler.clear("randomized_post")
                 self.auto_post_enabled = False
                 logging.info(f"🚫 Bot {self.name}: Auto post disabled.")
             else:
@@ -1547,7 +657,7 @@ class Bot:
         elif cmd == "start post":
             if not self.auto_post_enabled:
                 self.auto_post_enabled = True
-                self.schedule_next_tweet_job()
+                self.schedule_next_post_job()
                 logging.info(f"✅ Bot {self.name}: Auto post enabled.")
             else:
                 logging.info(f"ℹ️ Bot {self.name}: Auto post is already enabled.")
@@ -1583,16 +693,16 @@ class Bot:
             if not self.auto_cross_enabled:
                 self.auto_cross_enabled = True
                 self.scheduler.every(1).hours.do(self.cross_job_wrapper).tag("cross_engagement")
-                logging.info(f"✅ Bot {self.name}: Auto cross-bot engagement enabled.")
+                logging.info(f"✅ Bot {self.name}: Auto cross-platform engagement enabled.")
             else:
-                logging.info(f"ℹ️ Bot {self.name}: Auto cross engagement is already enabled.")
+                logging.info(f"ℹ️ Bot {self.name}: Auto cross-platform engagement is already enabled.")
         elif cmd == "stop cross":
             if self.auto_cross_enabled:
                 self.scheduler.clear("cross_engagement")
                 self.auto_cross_enabled = False
-                logging.info(f"🚫 Bot {self.name}: Auto cross-bot engagement disabled.")
+                logging.info(f"🚫 Bot {self.name}: Auto cross-platform engagement disabled.")
             else:
-                logging.info(f"ℹ️ Bot {self.name}: Auto cross engagement is already disabled.")
+                logging.info(f"ℹ️ Bot {self.name}: Auto cross-platform engagement is already disabled.")
         elif cmd == "start trending":
             if not self.auto_trending_enabled:
                 self.auto_trending_enabled = True
@@ -1629,7 +739,8 @@ class Bot:
             else:
                 recipient = parts[2].strip()
                 message = input("Enter DM message: ")
-                self.send_dm(recipient, message)
+                for adapter in self.platform_adapters.values():
+                    adapter.send_dm(recipient, message)
         elif cmd == "start story":
             if not self.auto_story_enabled:
                 self.auto_story_enabled = True
@@ -1647,13 +758,15 @@ class Bot:
         elif cmd.startswith("run story"):
             logging.info(f"🚀 Bot {self.name}: 'run story' command received. Running storytelling {self.story_run_count} time(s).")
             for _ in range(self.story_run_count):
-                self.run_collaborative_storytelling()
+                self.story_job_wrapper()
         elif cmd == "run image tweet":
             logging.info(f"🚀 Bot {self.name}: 'run image tweet' command received.")
-            self.post_tweet_with_image()
+            for adapter in self.platform_adapters.values():
+                adapter.post_with_image()
         elif cmd == "run adaptive tune":
             logging.info(f"🚀 Bot {self.name}: Running adaptive tuning based on engagement metrics.")
-            self.adaptive_tune()
+            for adapter in self.platform_adapters.values():
+                adapter.adaptive_tune()
         elif cmd == "show metrics":
             if os.path.exists(self.engagement_metrics_file):
                 try:
@@ -1692,9 +805,9 @@ class Bot:
             "  stop                 - Stop this bot\n"
             "  new auth             - Delete token file (force reauthentication on next startup)\n"
             "  auth age             - Show time remaining until token expiration (assumed 90 days)\n"
-            "  run post             - Post a tweet immediately.\n"
-            "  run comment          - Check and comment on new tweets.\n"
-            "  run reply            - Check and reply to replies.\n"
+            "  run post             - Post on all platforms immediately.\n"
+            "  run comment          - Comment on all platforms immediately.\n"
+            "  run reply            - Reply on all platforms immediately.\n"
             "  set post count <num> - Set number of posts to run.\n"
             "  set comment count <num> - Set number of comments to run.\n"
             "  set reply count <num>   - Set number of replies to run.\n"
@@ -1710,8 +823,8 @@ class Bot:
             "  start comment        - Start the auto comment function.\n"
             "  stop reply           - Stop the auto reply function.\n"
             "  start reply          - Start the auto reply function.\n"
-            "  start cross          - Enable auto cross-bot engagement.\n"
-            "  stop cross           - Disable auto cross-bot engagement.\n"
+            "  start cross          - Enable auto cross-platform engagement.\n"
+            "  stop cross           - Disable auto cross-platform engagement.\n"
             "  start trending       - Enable auto trending engagement.\n"
             "  stop trending        - Disable auto trending engagement.\n"
             "  start dm             - Enable auto DM checking.\n"
@@ -1719,8 +832,8 @@ class Bot:
             "  run dm {username}    - Send a DM to a specified user.\n"
             "  start story          - Enable auto collaborative storytelling.\n"
             "  stop story           - Disable auto collaborative storytelling.\n"
-            "  run story            - Run a storytelling tweet immediately.\n"
-            "  run image tweet      - Post a tweet with an auto-generated image (and audio if engagement is high).\n"
+            "  run story            - Run a collaborative storytelling post immediately.\n"
+            "  run image tweet      - Post on all platforms with an auto-generated image (and audio if engagement is high).\n"
             "  run adaptive tune    - Adjust parameters based on engagement metrics.\n"
             "  show metrics         - Display last engagement metrics.\n"
             "  set mood {mood}      - Manually set the bot's mood (e.g., happy, neutral, serious).\n"
@@ -1752,7 +865,7 @@ class Bot:
         now = datetime.datetime.now()
         output = [f"Status: {self.get_status()}"]
         if self.auto_post_enabled:
-            post_jobs = [job for job in self.scheduler.jobs if "randomized_tweet" in job.tags]
+            post_jobs = [job for job in self.scheduler.jobs if "randomized_post" in job.tags]
             if post_jobs and post_jobs[0].next_run:
                 diff_post = post_jobs[0].next_run - now
                 output.append(f"📝 Bot {self.name}: Auto post ENABLED; Next post in: {diff_post} (at {post_jobs[0].next_run.strftime('%Y-%m-%d %H:%M:%S')})")
@@ -1781,3 +894,30 @@ class Bot:
         print("\n".join(output))
 
 # End of Bot class
+
+if __name__ == "__main__":
+    import glob
+    # Load all configuration files from CONFIGS_DIR (assumed to be YAML files)
+    config_files = glob.glob(os.path.join(CONFIGS_DIR, "*.yaml"))
+    start_port = 5050
+    bots = []
+    for idx, config_file in enumerate(config_files):
+        bot_name = os.path.splitext(os.path.basename(config_file))[0]
+        port = start_port + idx
+        bot_instance = Bot(bot_name, config_file, port)
+        bot_instance.load_config()
+        from src.platforms.twitter import TwitterAdapter
+        from src.platforms.facebook import FacebookAdapter
+        from src.platforms.instagram import InstagramAdapter
+        from src.platforms.telegram import TelegramAdapter
+        from src.platforms.discord import DiscordAdapter
+        bot_instance.add_platform_adapter("twitter", TwitterAdapter(bot_instance))
+        bot_instance.add_platform_adapter("facebook", FacebookAdapter(bot_instance))
+        bot_instance.add_platform_adapter("instagram", InstagramAdapter(bot_instance))
+        bot_instance.add_platform_adapter("telegram", TelegramAdapter(bot_instance))
+        bot_instance.add_platform_adapter("discord", DiscordAdapter(bot_instance))
+        bot_instance.start()
+        bots.append(bot_instance)
+    print("Loaded bots:")
+    for bot in bots:
+        print(f"Bot {bot.name} running on port {bot.port}")

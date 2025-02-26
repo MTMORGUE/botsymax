@@ -23,21 +23,61 @@ def print_master_prompt():
 def print_bot_prompt(bot):
     print(f"\n[Bot {bot.name}] ", end='')
 
-def bot_menu(bot: Bot):
-    logging.info(f"🔔 Now controlling bot '{bot.name}'.")
-    print(f"\nNow controlling bot '{bot.name}'. Type commands for this bot (type 'back' to return to master console).")
-    bot.show_listener_state()
+def platform_menu(bot: Bot, platform: str):
+    logging.info(f"🔔 Now controlling bot '{bot.name}' on platform '{platform}'.")
+    print(f"\nNow controlling bot '{bot.name}' on platform '{platform}'.")
+    print("Type commands for this platform (type 'back' to return to the bot menu).")
     while True:
-        print_bot_prompt(bot)
+        print(f"[{bot.name} - {platform}] ", end='')
         cmd = input().strip().lower()
         if cmd == "back":
-            logging.info(f"🔔 Exiting control of bot '{bot.name}'. Returning to master console.")
+            logging.info(f"🔔 Exiting control for platform '{platform}' of bot '{bot.name}'. Returning to bot menu.")
             break
         try:
-            bot.process_console_command(cmd)
+            # For commands that generate posts/comments/replies, ensure the bot has a run count attribute.
+            if cmd.startswith("run post"):
+                if not hasattr(bot, "post_run_count"):
+                    bot.post_run_count = 1
+                bot.process_console_command(cmd)
+            elif cmd.startswith("run comment"):
+                if not hasattr(bot, "comment_run_count"):
+                    bot.comment_run_count = 1
+                bot.process_console_command(cmd)
+            elif cmd.startswith("run reply"):
+                if not hasattr(bot, "reply_run_count"):
+                    bot.reply_run_count = 1
+                bot.process_console_command(cmd)
+            else:
+                bot.process_console_command(cmd)
         except Exception as e:
-            logging.error(f"❌ Error executing command '{cmd}': {e}")
+            logging.error(f"❌ Error executing command '{cmd}' on platform {platform}: {e}")
             input("Press Enter to continue...")
+
+def bot_menu(bot: Bot):
+    logging.info(f"🔔 Now controlling bot '{bot.name}'.")
+    while True:
+        print(f"\nNow controlling bot '{bot.name}'.")
+        print("Enter a platform to control (twitter, facebook, instagram, telegram, discord), 'all' for global commands, or 'back' to return to the master console:")
+        selection = input().strip().lower()
+        if selection == "back":
+            logging.info(f"🔔 Exiting control of bot '{bot.name}'. Returning to master console.")
+            break
+        elif selection == "all":
+            print(f"Running global commands for bot '{bot.name}'.")
+            while True:
+                print(f"[Bot {bot.name} Global] ", end='')
+                cmd = input().strip().lower()
+                if cmd == "back":
+                    break
+                try:
+                    bot.process_console_command(cmd)
+                except Exception as e:
+                    logging.error(f"❌ Error executing command '{cmd}': {e}")
+                    input("Press Enter to continue...")
+        elif selection in bot.platform_adapters:
+            platform_menu(bot, selection)
+        else:
+            print("Invalid platform. Try again.")
 
 def master_console(bots: dict):
     while True:
@@ -89,3 +129,5 @@ def master_console(bots: dict):
         else:
             logging.info("Invalid selection. Try again. (Type 'help' for a list of commands.)")
             input("Press Enter to continue in Master Console...")
+
+# End of console.py
