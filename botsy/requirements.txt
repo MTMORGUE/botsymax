@@ -1,0 +1,10 @@
+openai>=0.28.0
+tweepy>=4.0.0
+schedule>=1.1.0
+python-dotenv>=0.21.0
+Flask>=2.0.0
+PyYAML>=6.0
+pytz>=2021.1
+textblob>=0.17.1
+requests>=2.25.0
+discord.py>=1.7.3
